@@ -35,13 +35,13 @@ or export.
 
 TransPulse is a responsive, dark-themed web studio for viewing live-style
 captions. Choose a **Demo** to preview prepared conversations, or use **Mic** to
-recognize and translate speech in a supported browser. Completed captions appear
-in a transcript panel where they can be searched, copied, cleared, or downloaded.
+transcribe and translate microphone audio. Completed captions appear in a
+transcript panel where they can be searched, copied, cleared, or downloaded.
 
 | | |
 | --- | --- |
-| **Modes** | Prepared demo conversations and browser microphone capture |
-| **Languages** | Japanese, Hindi, Spanish, German, French, Korean, and English |
+| **Modes** | Prepared demo conversations and microphone transcription |
+| **Languages** | Automatic source-language detection plus Japanese, Hindi, Spanish, German, French, Korean, and English |
 | **Transcript exports** | Plain text (`.txt`), SubRip subtitles (`.srt`), and JSON (`.json`) |
 | **Layout** | Responsive studio with a caption stage, session controls, and transcript |
 
@@ -74,12 +74,13 @@ into a second header row.
 - **Demo conversations:** choose a prepared tech keynote, casual conversation,
   or team meeting. Demo captions are simulated from bundled sample lines; they
   do not play or analyze audio.
-- **Microphone captions:** use the browser's SpeechRecognition API for
-  continuous recognition and translate recognized text as the session runs.
-  Interim speech is translated with a short debounce; finalized phrases are
-  translated immediately without waiting for older network requests.
-- **Hindi support:** select Hindi (हिन्दी) as either the recognition language
-  or the translation language.
+- **Microphone captions:** record short microphone clips and transcribe them
+  through a server-side speech service only when audible speech is detected,
+  then translate recognized text only when its language differs from the
+  selected caption language. Automatic source detection supports English and
+  Japanese speech.
+- **Hindi support:** select Hindi (हिन्दी) as either the source or caption
+  language.
 - **High-visibility captions:** English translations start at a larger size
   than the original speech, and the stage shows an animated ECG-style signal
   while a session is live.
@@ -91,7 +92,7 @@ into a second header row.
 - **Accessible session feedback:** the current caption stage is announced as a
   live region, controls have accessible names, and session notices are exposed
   as status messages.
-- **Honest status and errors:** the interface reports unsupported recognition,
+- **Honest status and errors:** the interface reports unsupported recording,
   microphone permission problems, and translation failures rather than
   presenting them as successful captions.
 
@@ -101,9 +102,8 @@ into a second header row.
 
 - Node.js and npm
 - A modern browser for the web app
-- For microphone mode: a browser with SpeechRecognition support, microphone
-  permission, and a secure context (`localhost` is suitable for local
-  development)
+- For microphone mode: browser microphone permission, a secure context
+  (`localhost` is suitable for local development), and a Groq API key
 
 ### Install and run
 
@@ -115,6 +115,21 @@ npm run dev
 ```
 
 Open the local URL printed by Vite in your terminal.
+Create a Groq API key at [console.groq.com/keys](https://console.groq.com/keys)
+and add these server-only settings to the project-root `.env` file:
+
+```dotenv
+GROQ_API_KEY=your-groq-api-key
+GROQ_TRANSCRIPTION_MODEL=whisper-large-v3-turbo
+```
+
+Restart the dev server after changing `.env`. `GROQ_MODEL` is a chat model
+setting and is not used for audio transcription; the transcription endpoint
+requires a Whisper model. `.env` is git-ignored and must never be committed.
+For Cloudflare deployments, configure `GROQ_API_KEY` as a Worker secret (for
+example, with `npx wrangler secret put GROQ_API_KEY`). Never use a `VITE_`
+variable or commit the key to source control. Groq's free-tier limits and
+availability can change; check its current account limits before use.
 
 To create and preview a production build:
 
@@ -138,13 +153,15 @@ npm run preview
 
 ### Use a microphone
 
-1. Select **Mic** and set the source and caption languages.
+1. Select **Mic**. Leave the source language at **Auto detect** to handle both
+   English and Japanese, or select a specific language.
 2. Choose **Start microphone** and grant microphone access when prompted.
-3. Speak into the microphone. Choose **Pause session** to stop capture, or the
-   square stop control to end the session.
+3. Speak into the microphone or play speech from another phone near it. Captions
+   appear in short audio batches. Choose **Pause session** to stop capture, or
+   the square stop control to end the session.
 
-Recognition support varies by browser. If the browser does not provide
-SpeechRecognition, microphone mode is unavailable; Demo mode remains available.
+Microphone mode requires a browser with `getUserMedia` and `MediaRecorder`
+support. Demo mode remains available without microphone access.
 
 ### Customize captions and export
 
@@ -158,16 +175,20 @@ SpeechRecognition, microphone mode is unavailable; Demo mode remains available.
 
 ## Browser and network requirements
 
-- **Microphone mode** depends on the browser's SpeechRecognition implementation
-  and microphone permission. Browser support and recognition behavior can vary.
+- **Microphone mode** records audio in the browser and sends short clips to the
+  server-side Groq transcription API. It requires microphone permission, a
+  configured `GROQ_API_KEY` server secret, and network access. A best-effort
+  per-worker limit allows 20 requests per minute per Cloudflare client IP, and
+  clips larger than 10 MB are rejected. Audio is checked locally for activity
+  before upload; silent 10-second segments are discarded.
 - **Translation** uses the Google Translate web endpoint at
   `translate.googleapis.com`; live translation therefore requires network
-  access. No API key or project-specific environment variable is configured.
+  access.
 - **Demo mode** uses bundled sample captions and does not require microphone
   access.
-- Speech recognition and translation are provided by browser and online
-  services. Do not treat this demo as an offline or privacy-isolated captioning
-  system.
+- Audio is sent to Groq for transcription and recognized text is sent to the
+  Google Translate web endpoint for translation. Do not treat this app as an
+  offline or privacy-isolated captioning system.
 - The `.srt` export formats entries into four-second subtitle intervals; these
   are generated intervals, not measured speech timestamps.
 

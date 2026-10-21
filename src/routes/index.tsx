@@ -26,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { hasAudioLevel, hasSpeechActivity } from "@/lib/audio-activity";
 import { translateCaption } from "@/lib/translate-caption";
 
 export const Route = createFileRoute("/")({
@@ -50,29 +51,9 @@ export const Route = createFileRoute("/")({
 
 type Caption = { id: number; original: string; translation: string; time: string };
 type Utterance = { original: string; translation: string };
-type SpeechRecognitionResultLike = { isFinal: boolean; 0?: { transcript: string } };
-type SpeechRecognitionEventLike = { resultIndex: number; results: ArrayLike<SpeechRecognitionResultLike> };
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: { error?: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-};
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
-
-declare global {
-  interface Window {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  }
-}
 
 const languages = [
+  { value: "auto", label: "Auto detect", native: "Auto" },
   { value: "ja-JP", label: "Japanese", native: "日本語" },
   { value: "hi-IN", label: "Hindi", native: "हिन्दी" },
   { value: "es-ES", label: "Spanish", native: "Español" },
@@ -81,6 +62,23 @@ const languages = [
   { value: "ko-KR", label: "Korean", native: "한국어" },
   { value: "en-US", label: "English", native: "English" },
 ];
+const targetLanguages = languages.filter((language) => language.value !== "auto");
+const detectedLanguageCodes: Record<string, string> = {
+  en: "en",
+  english: "en",
+  ja: "ja",
+  japanese: "ja",
+  hi: "hi",
+  hindi: "hi",
+  es: "es",
+  spanish: "es",
+  de: "de",
+  german: "de",
+  fr: "fr",
+  french: "fr",
+  ko: "ko",
+  korean: "ko",
+};
 
 const presets: Record<string, { title: string; category: string; language: string; lines: Utterance[] }> = {
   keynote: {
@@ -129,7 +127,7 @@ function formatTime(date: Date) {
 function TransPulse() {
   const [mode, setMode] = useState<"demo" | "mic">("mic");
   const [preset, setPreset] = useState("keynote");
-  const [sourceLanguage, setSourceLanguage] = useState("ja-JP");
+  const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("en-US");
   const [running, setRunning] = useState(false);
   const [bilingual, setBilingual] = useState(true);
@@ -148,30 +146,24 @@ function TransPulse() {
   const [speakerCount, setSpeakerCount] = useState(1);
   const [exportOpen, setExportOpen] = useState(false);
   const [clipboardId, setClipboardId] = useState<number | null>(null);
-  const [recognitionAvailable, setRecognitionAvailable] = useState(false);
+  const [microphoneAvailable, setMicrophoneAvailable] = useState(false);
   const presetRef = useRef(preset);
   const runningRef = useRef(false);
   const indexRef = useRef(0);
   const wordTimerRef = useRef<number | undefined>(undefined);
   const sentenceTimerRef = useRef<number | undefined>(undefined);
-  const translationTimerRef = useRef<number | undefined>(undefined);
-  const translationAbortRef = useRef<AbortController | null>(null);
-  const translationRequestRef = useRef(0);
-  const currentCaptionIdRef = useRef(0);
+  const audioRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
+  const audioSegmentTimerRef = useRef<number | undefined>(undefined);
+  const audioLevelTimerRef = useRef<number | undefined>(undefined);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
+  const audioSamplesRef = useRef<Float32Array<ArrayBuffer> | null>(null);
+  const speechActivityMsRef = useRef(0);
+  const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const sessionGenerationRef = useRef(0);
   const captionIdRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
-  const recognitionRef = useRef<{
-    continuous: boolean;
-    interimResults: boolean;
-    lang: string;
-    onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-    onerror: ((event: { error?: string }) => void) | null;
-    onend: (() => void) | null;
-    start: () => void;
-    stop: () => void;
-    abort: () => void;
-  } | null>(null);
   const translationLabel = useMemo(
     () => languages.find((language) => language.value === targetLanguage)?.label ?? "English",
     [targetLanguage],
@@ -183,7 +175,11 @@ function TransPulse() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    setRecognitionAvailable(Boolean(window.SpeechRecognition || window.webkitSpeechRecognition));
+    setMicrophoneAvailable(
+      typeof navigator.mediaDevices?.getUserMedia === "function" &&
+        typeof window.MediaRecorder === "function" &&
+        typeof window.AudioContext === "function",
+    );
   }, []);
 
   useEffect(() => {
@@ -247,9 +243,10 @@ function TransPulse() {
     return () => {
       if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
       if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
-      if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
-      translationAbortRef.current?.abort();
-      recognitionRef.current?.abort();
+      if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
+      audioRecorderRef.current?.stop();
+      audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+      void audioContextRef.current?.close();
     };
   }, []);
 
@@ -259,151 +256,198 @@ function TransPulse() {
     setRunning(false);
     if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
     if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
-    if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
-    translationRequestRef.current += 1;
-    translationAbortRef.current?.abort();
-    translationAbortRef.current = null;
-    if (recognitionRef.current) {
-      recognitionRef.current.onend = null;
-      recognitionRef.current.stop();
-      recognitionRef.current = null;
+    if (audioSegmentTimerRef.current) window.clearTimeout(audioSegmentTimerRef.current);
+    if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
+    if (audioRecorderRef.current?.state === "recording") {
+      audioRecorderRef.current.stop();
     }
+    audioRecorderRef.current = null;
+    audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+    audioStreamRef.current = null;
+    audioAnalyserRef.current = null;
+    audioSamplesRef.current = null;
+    speechActivityMsRef.current = 0;
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
     if (mode === "demo" && (currentOriginal || currentTranslation)) {
       finishCaption(currentOriginal, currentTranslation);
     }
   }, [currentOriginal, currentTranslation, finishCaption, mode]);
 
-  const startStream = useCallback(() => {
-    if (running) {
+  const enqueueTranscription = useCallback((audio: Blob, sessionGeneration: number) => {
+    const transcription = transcriptionQueueRef.current.then(async () => {
+      if (sessionGeneration !== sessionGenerationRef.current) return;
+      const formData = new FormData();
+      formData.append("file", audio, `recording.${audio.type.includes("mp4") ? "mp4" : audio.type.includes("ogg") ? "ogg" : "webm"}`);
+      if (sourceLanguage !== "auto") {
+        formData.append("language", sourceLanguage.split("-")[0] ?? sourceLanguage);
+      }
+      const response = await fetch("/api/transcribe", { method: "POST", body: formData });
+      const payload: unknown = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload === "object" &&
+          payload !== null &&
+          "error" in payload &&
+          typeof payload.error === "string"
+            ? payload.error
+            : "The transcription service could not process this audio.";
+        throw new Error(message);
+      }
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        !("text" in payload) ||
+        typeof payload.text !== "string"
+      ) {
+        throw new Error("The transcription service returned an invalid response.");
+      }
+
+      const original = payload.text.trim();
+      if (sessionGeneration !== sessionGenerationRef.current) return;
+      if (!original) {
+        setNotice("No speech detected yet. Keep the other phone close to the microphone.");
+        return;
+      }
+
+      let translation = original;
+      const detectedLanguage =
+        "language" in payload && typeof payload.language === "string"
+          ? detectedLanguageCodes[payload.language.trim().toLowerCase()]
+          : undefined;
+      const languageForTranslation = sourceLanguage === "auto" ? detectedLanguage : sourceLanguage;
+      if (languageForTranslation) {
+        try {
+          translation = await translateCaption(original, languageForTranslation, targetLanguage);
+        } catch {
+          setNotice("Speech was transcribed, but translation failed. Check your internet connection.");
+          translation = "Translation unavailable";
+        }
+      } else {
+        setNotice("Speech was transcribed, but its language could not be detected for translation.");
+      }
+      if (sessionGeneration !== sessionGenerationRef.current) return;
+
+      const caption: Caption = {
+        id: ++captionIdRef.current,
+        original,
+        translation,
+        time: formatTime(new Date()),
+      };
+      setTranscript((previous) => [...previous, caption]);
+      setCurrentOriginal(original);
+      setCurrentTranslation(translation);
+      setNotice("");
+    });
+
+    transcriptionQueueRef.current = transcription.catch((error: unknown) => {
+      if (sessionGeneration !== sessionGenerationRef.current) return;
+      setNotice(error instanceof Error ? error.message : "Audio transcription failed. Check your connection and try again.");
+      stopStream();
+    });
+  }, [sourceLanguage, stopStream, targetLanguage]);
+
+  const startStream = useCallback(async () => {
+    if (runningRef.current) {
       stopStream();
       return;
     }
     if (mode === "mic") {
-      const RecognitionConstructor = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!RecognitionConstructor) {
-        setNotice("Live microphone captions aren’t supported by this browser. Try Chrome or Microsoft Edge.");
+      if (!microphoneAvailable) {
+        setNotice("Microphone recording is not supported by this browser. Try a current version of Chrome, Edge, or Safari.");
         return;
       }
       setNotice("");
-      const recognition = new RecognitionConstructor();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = sourceLanguage;
-      recognition.onresult = (event: SpeechRecognitionEventLike) => {
-        let finalText = "";
-        let interimText = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result?.isFinal) finalText += result[0]?.transcript ?? "";
-          else interimText += result?.[0]?.transcript ?? "";
-        }
-        const finalCaption = finalText.trim();
-        const interimCaption = interimText.trim();
-        if (finalCaption) {
-          const sessionGeneration = sessionGenerationRef.current;
-          const captionTime = formatTime(new Date());
-          const captionId = ++captionIdRef.current;
-          currentCaptionIdRef.current = captionId;
-          translationRequestRef.current += 1;
-          if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
-          translationAbortRef.current?.abort();
-          translationAbortRef.current = null;
-          setCurrentOriginal(finalCaption);
-          setCurrentTranslation("Translating…");
-          void translateCaption(finalCaption, sourceLanguage, targetLanguage)
-            .then((translation) => {
-              if (sessionGeneration !== sessionGenerationRef.current) return;
-              const caption: Caption = {
-                id: captionId,
-                original: finalCaption,
-                translation,
-                time: captionTime,
-              };
-              setTranscript((previous) => [...previous, caption].sort((a, b) => a.id - b.id));
-              if (currentCaptionIdRef.current === captionId) setCurrentTranslation(translation);
-            })
-            .catch(() => {
-              if (sessionGeneration === sessionGenerationRef.current) {
-                setNotice("Could not translate recognized speech. Check your internet connection and try again.");
-                if (currentCaptionIdRef.current === captionId) {
-                  setCurrentTranslation("Translation unavailable");
-                }
-              }
-            });
-        }
-
-        if (interimCaption) {
-          currentCaptionIdRef.current = 0;
-          const requestId = ++translationRequestRef.current;
-          if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
-          translationAbortRef.current?.abort();
-          setCurrentOriginal(interimCaption);
-          setCurrentTranslation("Translating…");
-          translationTimerRef.current = window.setTimeout(() => {
-            const controller = new AbortController();
-            translationAbortRef.current = controller;
-            void translateCaption(interimCaption, sourceLanguage, targetLanguage, controller.signal)
-              .then((translation) => {
-                if (requestId === translationRequestRef.current && runningRef.current) {
-                  setCurrentTranslation(translation);
-                }
-              })
-              .catch((error: unknown) => {
-                if (error instanceof Error && error.name === "AbortError") return;
-                if (requestId === translationRequestRef.current) {
-                  setNotice("Could not translate recognized speech. Check your internet connection and try again.");
-                }
-              });
-          }, 180);
-        }
-      };
-      recognition.onerror = (event: { error?: string }) => {
-        const error = event.error ?? "unknown";
-        if (error === "no-speech" || error === "network") {
-          setNotice(
-            error === "no-speech"
-              ? "No speech detected. Listening will continue."
-              : "Speech recognition lost its connection. Reconnecting…",
-          );
-          return;
-        }
-        const message = error === "not-allowed" || error === "service-not-allowed"
-          ? "Microphone permission was denied. Allow microphone access in your browser settings, then try again."
-          : "Speech recognition was interrupted. Check your microphone and try again.";
-        setNotice(message);
-        runningRef.current = false;
-        setRunning(false);
-        recognitionRef.current = null;
-      };
-      recognition.onend = () => {
-        if (runningRef.current && recognitionRef.current === recognition) {
-          window.setTimeout(() => {
-            if (!runningRef.current || recognitionRef.current !== recognition) return;
-            try {
-              recognition.start();
-            } catch {
-              setNotice("Please check that your microphone is available and try again.");
-              runningRef.current = false;
-              setRunning(false);
-              recognitionRef.current = null;
-            }
-          }, 250);
-        }
-      };
-      recognitionRef.current = recognition;
+      const sessionGeneration = ++sessionGenerationRef.current;
       runningRef.current = true;
-      sessionGenerationRef.current += 1;
       sessionStartedAtRef.current = Date.now();
       setRunning(true);
       setClock("00:00:00");
-      setNotice("");
+      setCurrentOriginal("Waiting for speech…");
+      setCurrentTranslation("Captions update about every 10 seconds when speech is detected.");
       try {
-        recognition.start();
-      } catch {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        });
+        if (sessionGeneration !== sessionGenerationRef.current || !runningRef.current) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        audioStreamRef.current = stream;
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        audioContext.createMediaStreamSource(stream).connect(analyser);
+        await audioContext.resume();
+        if (sessionGeneration !== sessionGenerationRef.current || !runningRef.current) {
+          stream.getTracks().forEach((track) => track.stop());
+          void audioContext.close();
+          return;
+        }
+        audioAnalyserRef.current = analyser;
+        audioSamplesRef.current = new Float32Array(new ArrayBuffer(analyser.fftSize));
+        audioLevelTimerRef.current = window.setInterval(() => {
+          const activeAnalyser = audioAnalyserRef.current;
+          const samples = audioSamplesRef.current;
+          if (!activeAnalyser || !samples) return;
+          activeAnalyser.getFloatTimeDomainData(samples);
+          if (hasAudioLevel(samples)) speechActivityMsRef.current += 100;
+        }, 100);
+
+        const startSegment = () => {
+          if (sessionGeneration !== sessionGenerationRef.current || !runningRef.current) return;
+          try {
+            const supportedMimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]
+              .find((type) => MediaRecorder.isTypeSupported(type));
+            const recorder = supportedMimeType
+              ? new MediaRecorder(stream, { mimeType: supportedMimeType })
+              : new MediaRecorder(stream);
+            const chunks: Blob[] = [];
+            audioRecorderRef.current = recorder;
+            recorder.ondataavailable = (event) => {
+              if (event.data.size > 0) chunks.push(event.data);
+            };
+            recorder.onerror = () => {
+              setNotice("Microphone recording failed. Check microphone permission and try again.");
+              stopStream();
+            };
+            recorder.onstop = () => {
+              if (audioRecorderRef.current === recorder) audioRecorderRef.current = null;
+              const audio = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || "audio/webm" });
+              const hadSpeech = hasSpeechActivity(speechActivityMsRef.current);
+              speechActivityMsRef.current = 0;
+              if (audioSegmentTimerRef.current) window.clearTimeout(audioSegmentTimerRef.current);
+              if (audio.size > 0 && hadSpeech) enqueueTranscription(audio, sessionGeneration);
+              if (sessionGeneration === sessionGenerationRef.current && runningRef.current) startSegment();
+            };
+            recorder.start();
+            audioSegmentTimerRef.current = window.setTimeout(() => {
+              if (recorder.state === "recording") recorder.stop();
+            }, 10_000);
+          } catch {
+            setNotice("Could not record microphone audio. Check your browser and microphone settings.");
+            stopStream();
+          }
+        };
+
+        startSegment();
+      } catch (error) {
         runningRef.current = false;
         setRunning(false);
-        recognitionRef.current = null;
-        setNotice("Could not start the microphone. Allow microphone access and use a secure connection, then try again.");
+        if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
+        audioLevelTimerRef.current = undefined;
+        audioStreamRef.current?.getTracks().forEach((track) => track.stop());
+        audioStreamRef.current = null;
+        audioAnalyserRef.current = null;
+        audioSamplesRef.current = null;
+        void audioContextRef.current?.close();
+        audioContextRef.current = null;
+        setCurrentOriginal("");
+        setCurrentTranslation("");
+        setNotice(error instanceof DOMException && error.name === "NotAllowedError"
+          ? "Microphone permission was denied. Allow access in your browser settings, then try again."
+          : "Could not access the microphone. Check that it is connected and use a secure connection.");
       }
       return;
     }
@@ -415,7 +459,7 @@ function TransPulse() {
     sessionStartedAtRef.current = Date.now();
     setRunning(true);
     speakNext();
-  }, [mode, running, sourceLanguage, speakNext, stopStream, targetLanguage]);
+  }, [enqueueTranscription, microphoneAvailable, mode, speakNext, stopStream]);
 
   const choosePreset = (value: string) => {
     stopStream();
@@ -498,7 +542,7 @@ function TransPulse() {
               <span className="text-xs text-muted-foreground">→</span>
               <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={running}>
                 <SelectTrigger aria-label="Caption language" className="h-8 w-[126px] border-transparent bg-secondary/60 text-xs shadow-none"><SelectValue /></SelectTrigger>
-                <SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent>
+                <SelectContent>{targetLanguages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             <Button variant="ghost" size="icon" className="size-9" aria-label="Subtitle settings" title="Subtitle settings" onClick={() => setSettingsOpen((open) => !open)}><Settings2 size={17} /></Button>
@@ -510,7 +554,7 @@ function TransPulse() {
         <div className="flex items-center gap-2 border-t border-border/60 px-4 py-2 sm:hidden">
           <Select value={sourceLanguage} onValueChange={setSourceLanguage} disabled={running}><SelectTrigger aria-label="Source language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
           <span className="text-muted-foreground">→</span>
-          <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={running}><SelectTrigger aria-label="Caption language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
+          <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={running}><SelectTrigger aria-label="Caption language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{targetLanguages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
         </div>
         {exportOpen && <div className="absolute right-4 top-[60px] z-50 w-52 border border-border bg-popover p-1.5 shadow-lg sm:right-8">
           <div className="px-2.5 py-2 text-[10px] uppercase tracking-[1.5px] text-muted-foreground">Download transcript</div>
@@ -530,7 +574,7 @@ function TransPulse() {
               {mode === "demo" ? <Select value={preset} onValueChange={choosePreset}>
                 <SelectTrigger aria-label="Choose a demo conversation" className="h-9 w-[168px] border-transparent bg-transparent text-xs shadow-none sm:w-[225px]"><SelectValue /></SelectTrigger>
                 <SelectContent>{Object.entries(presets).map(([key, value]) => <SelectItem key={key} value={key}>{value.title}</SelectItem>)}</SelectContent>
-              </Select> : <span className="truncate text-xs text-muted-foreground">{recognitionAvailable ? "Speech recognition ready" : "Browser speech recognition unavailable"}</span>}
+              </Select> : <span className="truncate text-xs text-muted-foreground">{microphoneAvailable ? "Multilingual transcription ready" : "Microphone recording unavailable"}</span>}
             </div>
             <div className="flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
               <span className="hidden sm:inline">SOURCE</span><span className="language-chip">{languages.find((language) => language.value === sourceLanguage)?.native ?? sourceLanguage}</span>
@@ -565,10 +609,10 @@ function TransPulse() {
             <div className="control-strip mt-4 grid grid-cols-1 gap-4 border-y border-border py-4 sm:grid-cols-[1fr_auto_1fr] sm:items-center sm:gap-3">
               <div className="flex items-center gap-3 sm:justify-self-start">
                 <div className="control-icon"><span className={running ? "control-dot active" : "control-dot"} /></div>
-                <div><div className="text-xs font-medium">{running ? "Session live" : "Session paused"}</div><div className="mt-0.5 text-[10px] text-muted-foreground">{mode === "demo" ? `${transcript.length} captions received` : recognitionAvailable ? "Microphone ready" : "Use a supported browser"}</div></div>
+                <div><div className="text-xs font-medium">{running ? "Session live" : "Session paused"}</div><div className="mt-0.5 text-[10px] text-muted-foreground">{mode === "demo" ? `${transcript.length} captions received` : microphoneAvailable ? "Microphone ready" : "Use a supported browser"}</div></div>
               </div>
               <div className="flex items-center gap-2 sm:justify-self-center">
-                <Button onClick={startStream} className={running ? "h-10 min-w-[164px] gap-2 px-5" : "h-10 min-w-[164px] gap-2 px-5 primary-glow"} disabled={mode === "mic" && !recognitionAvailable}>
+                <Button onClick={startStream} className={running ? "h-10 min-w-[164px] gap-2 px-5" : "h-10 min-w-[164px] gap-2 px-5 primary-glow"} disabled={mode === "mic" && !microphoneAvailable}>
                   {running ? <><Pause size={15} />Pause session</> : mode === "mic" ? <><Mic size={15} />Start microphone</> : <><Play size={15} fill="currentColor" />Start session</>}
                 </Button>
                 {running && <Button variant="outline" size="icon" className="size-10" onClick={stopStream} aria-label="Stop session" title="Stop session"><Square size={14} fill="currentColor" /></Button>}
@@ -585,7 +629,7 @@ function TransPulse() {
               <div className="flex items-center justify-between"><div><div className="text-xs font-medium">Original captions</div><div className="mt-1 text-[10px] text-muted-foreground">Show above {translationLabel}</div></div><Switch aria-label="Show original captions" checked={bilingual} onCheckedChange={setBilingual} /></div>
             </div>}
 
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 text-[10px] text-muted-foreground"><div className="flex items-center gap-2"><Radio size={13} /><span>{mode === "demo" ? "SIMULATION" : "SPEECH + TRANSLATION"}</span><span className="text-border">·</span><span>{mode === "demo" ? "Streaming preview only" : "Speech recognition and translation use online services"}</span></div><span className="font-mono">{mode === "demo" ? "~120 MS" : recognitionAvailable ? "LIVE" : "UNAVAILABLE"}</span></div>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 text-[10px] text-muted-foreground"><div className="flex items-center gap-2"><Radio size={13} /><span>{mode === "demo" ? "SIMULATION" : "SPEECH + TRANSLATION"}</span><span className="text-border">·</span><span>{mode === "demo" ? "Streaming preview only" : "Audio transcription and translation use online services"}</span></div><span className="font-mono">{mode === "demo" ? "~120 MS" : microphoneAvailable ? "LIVE" : "UNAVAILABLE"}</span></div>
           </div>
         </section>
 

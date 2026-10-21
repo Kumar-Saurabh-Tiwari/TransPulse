@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { handleTranscriptionRequest } from "./lib/transcribe-audio.server";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -44,9 +45,34 @@ function isH3SwallowedErrorBody(body: string): boolean {
   }
 }
 
+function getTranscriptionApiKey(env: unknown) {
+  if (typeof env === "object" && env !== null && "GROQ_API_KEY" in env) {
+    const key = env["GROQ_API_KEY"];
+    if (typeof key === "string" && key) return key;
+  }
+  return typeof process !== "undefined" ? process.env["GROQ_API_KEY"] : undefined;
+}
+
+function getTranscriptionModel(env: unknown) {
+  if (typeof env === "object" && env !== null && "GROQ_TRANSCRIPTION_MODEL" in env) {
+    const model = env["GROQ_TRANSCRIPTION_MODEL"];
+    if (typeof model === "string" && model) return model;
+  }
+  return typeof process !== "undefined"
+    ? process.env["GROQ_TRANSCRIPTION_MODEL"] || "whisper-large-v3-turbo"
+    : "whisper-large-v3-turbo";
+}
+
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
+      if (new URL(request.url).pathname === "/api/transcribe") {
+        return await handleTranscriptionRequest(
+          request,
+          getTranscriptionApiKey(env),
+          getTranscriptionModel(env),
+        );
+      }
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return await normalizeCatastrophicSsrResponse(response);
