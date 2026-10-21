@@ -20,6 +20,7 @@ or export.
 ## Contents
 
 - [At a glance](#at-a-glance)
+- [Previews](#previews)
 - [The studio](#the-studio)
 - [Features](#features)
 - [Getting started](#getting-started)
@@ -43,6 +44,12 @@ in a transcript panel where they can be searched, copied, cleared, or downloaded
 | **Languages** | Japanese, Hindi, Spanish, German, French, Korean, and English |
 | **Transcript exports** | Plain text (`.txt`), SubRip subtitles (`.srt`), and JSON (`.json`) |
 | **Layout** | Responsive studio with a caption stage, session controls, and transcript |
+
+## Previews
+
+![TransPulse preview](public/preview1.png)
+
+![TransPulse after starting a session](public/preview2-after-start.png)
 
 ## The studio
 
