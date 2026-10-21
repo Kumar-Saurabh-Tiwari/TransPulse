@@ -127,6 +127,54 @@ function formatTime(date: Date) {
   return new Intl.DateTimeFormat("en", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date);
 }
 
+function TypewriterText({
+  text,
+  onComplete,
+}: {
+  text: string;
+  onComplete: () => void;
+}) {
+  const [visibleCount, setVisibleCount] = useState(0);
+  const onCompleteRef = useRef(onComplete);
+  onCompleteRef.current = onComplete;
+
+  useEffect(() => {
+    const characters = Array.from(text);
+    setVisibleCount(0);
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setVisibleCount(characters.length);
+      onCompleteRef.current();
+      return;
+    }
+
+    let frame = 0;
+    let startTime: number | undefined;
+    const typeNextFrame = (time: number) => {
+      startTime ??= time;
+      const nextCount = Math.min(characters.length, Math.floor((time - startTime) * 0.04));
+      setVisibleCount(nextCount);
+      if (nextCount < characters.length) {
+        frame = window.requestAnimationFrame(typeNextFrame);
+      } else {
+        onCompleteRef.current();
+      }
+    };
+
+    frame = window.requestAnimationFrame(typeNextFrame);
+    return () => window.cancelAnimationFrame(frame);
+  }, [text]);
+
+  const characters = Array.from(text);
+  const isTyping = visibleCount < characters.length;
+
+  return (
+    <span aria-label={text}>
+      {characters.slice(0, visibleCount).join("")}
+      {isTyping && <span className="transcript-type-cursor" aria-hidden="true" />}
+    </span>
+  );
+}
+
 function TransPulse() {
   const [mode, setMode] = useState<"demo" | "mic">("mic");
   const [preset, setPreset] = useState("keynote");
@@ -141,6 +189,7 @@ function TransPulse() {
   const [historyOpen, setHistoryOpen] = useState(true);
   const [search, setSearch] = useState("");
   const [transcript, setTranscript] = useState<Caption[]>([]);
+  const [typingCaptionId, setTypingCaptionId] = useState<number | null>(null);
   const [currentOriginal, setCurrentOriginal] = useState("");
   const [currentTranslation, setCurrentTranslation] = useState("");
   const [showOriginal, setShowOriginal] = useState(true);
@@ -150,6 +199,8 @@ function TransPulse() {
   const [exportOpen, setExportOpen] = useState(false);
   const [clipboardId, setClipboardId] = useState<number | null>(null);
   const [microphoneAvailable, setMicrophoneAvailable] = useState(false);
+  const transcriptListRef = useRef<HTMLDivElement | null>(null);
+  const followLatestCaptionRef = useRef(true);
   const presetRef = useRef(preset);
   const runningRef = useRef(false);
   const indexRef = useRef(0);
@@ -199,6 +250,11 @@ function TransPulse() {
     return () => window.clearInterval(timer);
   }, [running]);
 
+  useEffect(() => {
+    const list = transcriptListRef.current;
+    if (list && followLatestCaptionRef.current) list.scrollTop = list.scrollHeight;
+  }, [transcript.length]);
+
   const finishCaption = useCallback((original: string, translation: string) => {
     if (!original.trim() && !translation.trim()) return;
     const caption: Caption = {
@@ -207,9 +263,14 @@ function TransPulse() {
       translation: translation.trim() || original.trim(),
       time: formatTime(new Date()),
     };
+    setTypingCaptionId(caption.id);
     setTranscript((previous) => [...previous, caption]);
     setCurrentOriginal("");
     setCurrentTranslation("");
+  }, []);
+
+  const finishTypingCaption = useCallback((id: number) => {
+    setTypingCaptionId((current) => (current === id ? null : current));
   }, []);
 
   const speakNext = useCallback(() => {
@@ -344,6 +405,7 @@ function TransPulse() {
         translation,
         time: formatTime(new Date()),
       };
+      setTypingCaptionId(caption.id);
       setTranscript((previous) => [...previous, caption]);
       setCurrentOriginal(deduplicated);
       setCurrentTranslation(translation);
@@ -549,8 +611,8 @@ function TransPulse() {
         </div>}
       </header>
 
-      <div id="studio" className="mx-auto grid w-full max-w-[1680px] grid-cols-1 lg:min-h-[calc(100vh-67px)] lg:grid-cols-[minmax(0,1fr)_330px]">
-        <section className="flex min-w-0 flex-col border-border lg:border-r">
+      <div id="studio" className="mx-auto grid w-full max-w-[1760px] grid-cols-1 lg:h-[calc(100dvh-67px)] lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_460px]">
+        <section className="flex min-w-0 flex-col border-border lg:min-h-0 lg:overflow-y-auto lg:border-r">
           <div className="flex min-h-16 items-center justify-between gap-3 border-b border-border px-4 sm:px-7">
             <div className="flex min-w-0 items-center gap-3">
               <div className="mode-switch" aria-label="Captioning mode">
@@ -619,19 +681,28 @@ function TransPulse() {
           </div>
         </section>
 
-        <aside className={historyOpen ? "transcript-panel flex min-h-[500px] min-w-0 flex-col lg:min-h-0" : "transcript-panel flex min-w-0 flex-col"}>
+        <aside className={historyOpen ? "transcript-panel flex min-h-[420px] min-w-0 flex-col overflow-hidden lg:min-h-0" : "transcript-panel flex min-w-0 flex-col overflow-hidden"}>
           <div className="flex h-16 shrink-0 items-center justify-between border-b border-border px-5">
-            <div className="flex items-center gap-2.5"><h2 className="text-[13px] font-semibold">Live transcript</h2><span className="count-chip">{transcript.length.toString().padStart(2, "0")}</span></div>
+            <div className="flex items-center gap-2.5"><h2 className="text-[15px] font-semibold">Live transcript</h2><span className="count-chip">{transcript.length.toString().padStart(2, "0")}</span></div>
             <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" onClick={() => setHistoryOpen((open) => !open)} aria-label={historyOpen ? "Collapse transcript" : "Expand transcript"}><ChevronDown size={16} className={historyOpen ? "rotate-0" : "-rotate-90"} /></Button>
           </div>
           {historyOpen && <>
             <div className="border-b border-border p-4">
-              <div className="relative"><Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" /><Input aria-label="Search transcript" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a phrase…" className="h-9 border-border/80 pl-9 pr-8 text-xs" />{search && <Button variant="ghost" size="icon" className="absolute right-1 top-1/2 size-7 -translate-y-1/2 text-muted-foreground" onClick={() => setSearch("")} aria-label="Clear search"><X size={13} /></Button>}</div>
+              <div className="relative"><Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" /><Input aria-label="Search transcript" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a phrase…" className="h-10 border-border/80 pl-10 pr-8 text-sm" />{search && <Button variant="ghost" size="icon" className="absolute right-1 top-1/2 size-7 -translate-y-1/2 text-muted-foreground" onClick={() => setSearch("")} aria-label="Clear search"><X size={14} /></Button>}</div>
             </div>
-            <div className="transcript-list min-h-0 flex-1 overflow-y-auto px-4" aria-live="polite">
-              {filteredTranscript.length > 0 ? <div className="divide-y divide-border/70">{filteredTranscript.map((entry, index) => <article key={entry.id} className="transcript-entry group py-4"><div className="mb-2.5 flex items-center justify-between"><div className="flex items-center gap-2"><span className="entry-index">{String(index + 1).padStart(2, "0")}</span><span className="font-mono text-[10px] text-muted-foreground">{entry.time}</span></div><Button variant="ghost" size="icon" className="size-7 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100" onClick={() => void copyCaption(entry)} aria-label={`Copy caption ${index + 1}`} title="Copy caption">{clipboardId === entry.id ? <Check size={13} /> : <Clipboard size={13} />}</Button></div>{entry.original && <p className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">{entry.original}</p>}<p className="text-[13px] leading-[1.65]">{entry.translation}</p></article>)}</div> : <div className="transcript-empty"><div className="transcript-empty-icon"><FileText size={17} /></div><p className="text-xs font-medium">{search ? "No matching captions" : "Nothing transcribed yet"}</p><p className="mt-1.5 max-w-[215px] text-center text-[11px] leading-relaxed text-muted-foreground">{search ? "Try another word or phrase." : "Completed captions will appear here as your session runs."}</p></div>}
+            <div
+              ref={transcriptListRef}
+              onScroll={(event) => {
+                const list = event.currentTarget;
+                followLatestCaptionRef.current =
+                  list.scrollHeight - list.scrollTop - list.clientHeight < 120;
+              }}
+              className="transcript-list min-h-0 max-h-[60vh] flex-1 overflow-y-auto px-5 lg:max-h-none"
+              aria-live="polite"
+            >
+              {filteredTranscript.length > 0 ? <div className="divide-y divide-border/70">{filteredTranscript.map((entry, index) => <article key={entry.id} className="transcript-entry group py-4"><div className="mb-2.5 flex items-center justify-between"><div className="flex items-center gap-2"><span className="entry-index">{String(index + 1).padStart(2, "0")}</span><span className="font-mono text-[11px] text-muted-foreground">{entry.time}</span></div><Button variant="ghost" size="icon" className="size-8 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100" onClick={() => void copyCaption(entry)} aria-label={`Copy caption ${index + 1}`} title="Copy caption">{clipboardId === entry.id ? <Check size={15} /> : <Clipboard size={15} />}</Button></div>{entry.original && <p className="mb-1.5 text-[13px] leading-relaxed text-muted-foreground">{entry.original}</p>}<p className="text-[15px] leading-[1.7]">{typingCaptionId === entry.id ? <TypewriterText text={entry.translation} onComplete={() => finishTypingCaption(entry.id)} /> : entry.translation}</p></article>)}</div> : <div className="transcript-empty"><div className="transcript-empty-icon"><FileText size={17} /></div><p className="text-sm font-medium">{search ? "No matching captions" : "Nothing transcribed yet"}</p><p className="mt-1.5 max-w-[260px] text-center text-[13px] leading-relaxed text-muted-foreground">{search ? "Try another word or phrase." : "Completed captions will appear here as your session runs."}</p></div>}
             </div>
-            <div className="border-t border-border px-4 py-3"><div className="flex items-center justify-between text-[10px] text-muted-foreground"><span className="flex items-center gap-1.5"><span className={running ? "status-indicator active" : "status-indicator"} />{running ? "Capturing captions" : "Waiting for a session"}</span><span>{filteredTranscript.length} {filteredTranscript.length === 1 ? "entry" : "entries"}</span></div><Button variant="ghost" className="mt-3 h-8 w-full gap-2 border border-border/70 text-[11px] text-muted-foreground hover:text-foreground" disabled={transcript.length === 0} onClick={() => { setExportOpen(true); }}><Download size={13} />Export transcript</Button></div>
+            <div className="border-t border-border px-4 py-3"><div className="flex items-center justify-between text-xs text-muted-foreground"><span className="flex items-center gap-2"><span className={running ? "status-indicator active" : "status-indicator"} />{running ? "Capturing captions" : "Waiting for a session"}</span><span>{filteredTranscript.length} {filteredTranscript.length === 1 ? "entry" : "entries"}</span></div><Button variant="ghost" className="mt-3 h-9 w-full gap-2 border border-border/70 text-xs text-muted-foreground hover:text-foreground" disabled={transcript.length === 0} onClick={() => { setExportOpen(true); }}><Download size={14} />Export transcript</Button></div>
           </>}
         </aside>
       </div>

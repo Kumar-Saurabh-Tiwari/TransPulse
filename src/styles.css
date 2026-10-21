@@ -124,8 +124,10 @@
 .pace-label { min-width: 49px; color: var(--foreground); text-align: right; }
 .notice-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 5px 0 5px 10px; color: var(--muted-foreground); font-size: 11px; }
 .transcript-panel { background: color-mix(in oklab, var(--card) 45%, var(--background)); }
+.transcript-list { overscroll-behavior: contain; scrollbar-color: var(--border) transparent; scrollbar-gutter: stable; }
 .count-chip { display: grid; min-width: 23px; height: 19px; place-items: center; padding: 0 5px; background: var(--secondary); color: var(--primary); font-family: var(--font-mono); font-size: 10px; }
 .transcript-entry { animation: caption-enter 220ms ease both; }
+.transcript-type-cursor { display: inline-block; width: 2px; height: .9em; margin-left: 2px; vertical-align: -.08em; background: var(--primary); animation: blink 800ms steps(2, start) infinite; }
 .entry-index { color: var(--primary); font-family: var(--font-mono); font-size: 9px; }
 .transcript-empty { display: flex; min-height: 190px; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
 .transcript-empty-icon { display: grid; width: 38px; height: 38px; margin-bottom: 14px; place-items: center; border: 1px solid var(--border); color: var(--muted-foreground); }
