@@ -82,7 +82,14 @@ export async function handleTranscriptionRequest(
   }
 
   const providerForm = new FormData();
-  providerForm.append("file", audio, audio.name || "recording.webm");
+  const fileName =
+    audio.name ||
+    (audio.type.includes("wav")
+      ? "recording.wav"
+      : audio.type.includes("mp4")
+        ? "recording.mp4"
+        : "recording.webm");
+  providerForm.append("file", audio, fileName);
   providerForm.append("model", model);
   providerForm.append("response_format", "verbose_json");
   const languageHint = submitted.get("language");

@@ -78,7 +78,9 @@ into a second header row.
   through a server-side speech service only when audible speech is detected,
   then translate recognized text only when its language differs from the
   selected caption language. Automatic source detection supports English and
-  Japanese speech.
+  Japanese speech. Local audio processing keeps the microphone stream
+  continuous, skips silent clips, and overlaps transcription windows slightly
+  to reduce clipped words.
 - **Hindi support:** select Hindi (हिन्दी) as either the source or caption
   language.
 - **High-visibility captions:** English translations start at a larger size
@@ -180,7 +182,9 @@ support. Demo mode remains available without microphone access.
   configured `GROQ_API_KEY` server secret, and network access. A best-effort
   per-worker limit allows 20 requests per minute per Cloudflare client IP, and
   clips larger than 10 MB are rejected. Audio is checked locally for activity
-  before upload; silent 10-second segments are discarded.
+  before upload; silent 10-second segments are discarded. Active clips are
+  converted locally to mono 16 kHz WAV and overlap by 800 ms to prevent small
+  capture gaps without increasing the transcription request rate.
 - **Translation** uses the Google Translate web endpoint at
   `translate.googleapis.com`; live translation therefore requires network
   access.

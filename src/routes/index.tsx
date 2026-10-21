@@ -26,7 +26,10 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
-import { hasAudioLevel, hasSpeechActivity } from "@/lib/audio-activity";
+import {
+  removeTranscriptOverlap,
+  SpeechAudioChunker,
+} from "@/lib/audio-activity";
 import { translateCaption } from "@/lib/translate-caption";
 
 export const Route = createFileRoute("/")({
@@ -152,15 +155,13 @@ function TransPulse() {
   const indexRef = useRef(0);
   const wordTimerRef = useRef<number | undefined>(undefined);
   const sentenceTimerRef = useRef<number | undefined>(undefined);
-  const audioRecorderRef = useRef<MediaRecorder | null>(null);
   const audioStreamRef = useRef<MediaStream | null>(null);
-  const audioSegmentTimerRef = useRef<number | undefined>(undefined);
-  const audioLevelTimerRef = useRef<number | undefined>(undefined);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const audioAnalyserRef = useRef<AnalyserNode | null>(null);
-  const audioSamplesRef = useRef<Float32Array<ArrayBuffer> | null>(null);
-  const speechActivityMsRef = useRef(0);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const audioMuteGainRef = useRef<GainNode | null>(null);
   const transcriptionQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const previousTranscribedTextRef = useRef("");
   const sessionGenerationRef = useRef(0);
   const captionIdRef = useRef(0);
   const sessionStartedAtRef = useRef<number | null>(null);
@@ -177,7 +178,6 @@ function TransPulse() {
     if (typeof window === "undefined") return;
     setMicrophoneAvailable(
       typeof navigator.mediaDevices?.getUserMedia === "function" &&
-        typeof window.MediaRecorder === "function" &&
         typeof window.AudioContext === "function",
     );
   }, []);
@@ -243,8 +243,10 @@ function TransPulse() {
     return () => {
       if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
       if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
-      if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
-      audioRecorderRef.current?.stop();
+      if (audioProcessorRef.current) audioProcessorRef.current.onaudioprocess = null;
+      audioProcessorRef.current?.disconnect();
+      audioSourceRef.current?.disconnect();
+      audioMuteGainRef.current?.disconnect();
       audioStreamRef.current?.getTracks().forEach((track) => track.stop());
       void audioContextRef.current?.close();
     };
@@ -256,17 +258,15 @@ function TransPulse() {
     setRunning(false);
     if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
     if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
-    if (audioSegmentTimerRef.current) window.clearTimeout(audioSegmentTimerRef.current);
-    if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
-    if (audioRecorderRef.current?.state === "recording") {
-      audioRecorderRef.current.stop();
-    }
-    audioRecorderRef.current = null;
+    if (audioProcessorRef.current) audioProcessorRef.current.onaudioprocess = null;
+    audioProcessorRef.current?.disconnect();
+    audioProcessorRef.current = null;
+    audioSourceRef.current?.disconnect();
+    audioSourceRef.current = null;
+    audioMuteGainRef.current?.disconnect();
+    audioMuteGainRef.current = null;
     audioStreamRef.current?.getTracks().forEach((track) => track.stop());
     audioStreamRef.current = null;
-    audioAnalyserRef.current = null;
-    audioSamplesRef.current = null;
-    speechActivityMsRef.current = 0;
     void audioContextRef.current?.close();
     audioContextRef.current = null;
     if (mode === "demo" && (currentOriginal || currentTranslation)) {
@@ -278,7 +278,14 @@ function TransPulse() {
     const transcription = transcriptionQueueRef.current.then(async () => {
       if (sessionGeneration !== sessionGenerationRef.current) return;
       const formData = new FormData();
-      formData.append("file", audio, `recording.${audio.type.includes("mp4") ? "mp4" : audio.type.includes("ogg") ? "ogg" : "webm"}`);
+      const extension = audio.type.includes("wav")
+        ? "wav"
+        : audio.type.includes("mp4")
+          ? "mp4"
+          : audio.type.includes("ogg")
+            ? "ogg"
+            : "webm";
+      formData.append("file", audio, `recording.${extension}`);
       if (sourceLanguage !== "auto") {
         formData.append("language", sourceLanguage.split("-")[0] ?? sourceLanguage);
       }
@@ -306,11 +313,14 @@ function TransPulse() {
       const original = payload.text.trim();
       if (sessionGeneration !== sessionGenerationRef.current) return;
       if (!original) {
-        setNotice("No speech detected yet. Keep the other phone close to the microphone.");
         return;
       }
 
-      let translation = original;
+      const deduplicated = removeTranscriptOverlap(previousTranscribedTextRef.current, original);
+      previousTranscribedTextRef.current = original.split(/\s+/).slice(-12).join(" ");
+      if (!deduplicated) return;
+
+      let translation = deduplicated;
       const detectedLanguage =
         "language" in payload && typeof payload.language === "string"
           ? detectedLanguageCodes[payload.language.trim().toLowerCase()]
@@ -318,7 +328,7 @@ function TransPulse() {
       const languageForTranslation = sourceLanguage === "auto" ? detectedLanguage : sourceLanguage;
       if (languageForTranslation) {
         try {
-          translation = await translateCaption(original, languageForTranslation, targetLanguage);
+          translation = await translateCaption(deduplicated, languageForTranslation, targetLanguage);
         } catch {
           setNotice("Speech was transcribed, but translation failed. Check your internet connection.");
           translation = "Translation unavailable";
@@ -330,12 +340,12 @@ function TransPulse() {
 
       const caption: Caption = {
         id: ++captionIdRef.current,
-        original,
+        original: deduplicated,
         translation,
         time: formatTime(new Date()),
       };
       setTranscript((previous) => [...previous, caption]);
-      setCurrentOriginal(original);
+      setCurrentOriginal(deduplicated);
       setCurrentTranslation(translation);
       setNotice("");
     });
@@ -364,7 +374,8 @@ function TransPulse() {
       setRunning(true);
       setClock("00:00:00");
       setCurrentOriginal("Waiting for speech…");
-      setCurrentTranslation("Captions update about every 10 seconds when speech is detected.");
+      setCurrentTranslation("Speech captions arrive in short overlapping clips.");
+      previousTranscribedTextRef.current = "";
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
@@ -376,71 +387,46 @@ function TransPulse() {
         audioStreamRef.current = stream;
         const audioContext = new AudioContext();
         audioContextRef.current = audioContext;
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 2048;
-        audioContext.createMediaStreamSource(stream).connect(analyser);
+        const source = audioContext.createMediaStreamSource(stream);
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        const muteGain = audioContext.createGain();
+        muteGain.gain.value = 0;
+        const chunker = new SpeechAudioChunker(audioContext.sampleRate);
+        audioSourceRef.current = source;
+        audioProcessorRef.current = processor;
+        audioMuteGainRef.current = muteGain;
+        source.connect(processor);
+        processor.connect(muteGain);
+        muteGain.connect(audioContext.destination);
         await audioContext.resume();
         if (sessionGeneration !== sessionGenerationRef.current || !runningRef.current) {
           stream.getTracks().forEach((track) => track.stop());
+          processor.disconnect();
+          source.disconnect();
+          muteGain.disconnect();
           void audioContext.close();
           return;
         }
-        audioAnalyserRef.current = analyser;
-        audioSamplesRef.current = new Float32Array(new ArrayBuffer(analyser.fftSize));
-        audioLevelTimerRef.current = window.setInterval(() => {
-          const activeAnalyser = audioAnalyserRef.current;
-          const samples = audioSamplesRef.current;
-          if (!activeAnalyser || !samples) return;
-          activeAnalyser.getFloatTimeDomainData(samples);
-          if (hasAudioLevel(samples)) speechActivityMsRef.current += 100;
-        }, 100);
-
-        const startSegment = () => {
+        processor.onaudioprocess = (event) => {
           if (sessionGeneration !== sessionGenerationRef.current || !runningRef.current) return;
-          try {
-            const supportedMimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]
-              .find((type) => MediaRecorder.isTypeSupported(type));
-            const recorder = supportedMimeType
-              ? new MediaRecorder(stream, { mimeType: supportedMimeType })
-              : new MediaRecorder(stream);
-            const chunks: Blob[] = [];
-            audioRecorderRef.current = recorder;
-            recorder.ondataavailable = (event) => {
-              if (event.data.size > 0) chunks.push(event.data);
-            };
-            recorder.onerror = () => {
-              setNotice("Microphone recording failed. Check microphone permission and try again.");
-              stopStream();
-            };
-            recorder.onstop = () => {
-              if (audioRecorderRef.current === recorder) audioRecorderRef.current = null;
-              const audio = new Blob(chunks, { type: recorder.mimeType || chunks[0]?.type || "audio/webm" });
-              const hadSpeech = hasSpeechActivity(speechActivityMsRef.current);
-              speechActivityMsRef.current = 0;
-              if (audioSegmentTimerRef.current) window.clearTimeout(audioSegmentTimerRef.current);
-              if (audio.size > 0 && hadSpeech) enqueueTranscription(audio, sessionGeneration);
-              if (sessionGeneration === sessionGenerationRef.current && runningRef.current) startSegment();
-            };
-            recorder.start();
-            audioSegmentTimerRef.current = window.setTimeout(() => {
-              if (recorder.state === "recording") recorder.stop();
-            }, 10_000);
-          } catch {
-            setNotice("Could not record microphone audio. Check your browser and microphone settings.");
-            stopStream();
+          const samples = event.inputBuffer.getChannelData(0);
+          for (const audio of chunker.push(samples)) {
+            enqueueTranscription(audio, sessionGeneration);
           }
         };
-
-        startSegment();
+        setNotice("");
       } catch (error) {
         runningRef.current = false;
         setRunning(false);
-        if (audioLevelTimerRef.current) window.clearInterval(audioLevelTimerRef.current);
-        audioLevelTimerRef.current = undefined;
+        if (audioProcessorRef.current) audioProcessorRef.current.onaudioprocess = null;
+        audioProcessorRef.current?.disconnect();
+        audioProcessorRef.current = null;
+        audioSourceRef.current?.disconnect();
+        audioSourceRef.current = null;
+        audioMuteGainRef.current?.disconnect();
+        audioMuteGainRef.current = null;
         audioStreamRef.current?.getTracks().forEach((track) => track.stop());
         audioStreamRef.current = null;
-        audioAnalyserRef.current = null;
-        audioSamplesRef.current = null;
         void audioContextRef.current?.close();
         audioContextRef.current = null;
         setCurrentOriginal("");
