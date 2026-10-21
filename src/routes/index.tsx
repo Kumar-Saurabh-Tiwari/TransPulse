@@ -12,7 +12,6 @@ import {
   Headphones,
   Languages,
   Mic,
-  MicOff,
   Pause,
   Play,
   Radio,
@@ -27,6 +26,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { translateCaption } from "@/lib/translate-caption";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -50,6 +50,27 @@ export const Route = createFileRoute("/")({
 
 type Caption = { id: number; original: string; translation: string; time: string };
 type Utterance = { original: string; translation: string };
+type SpeechRecognitionResultLike = { isFinal: boolean; 0?: { transcript: string } };
+type SpeechRecognitionEventLike = { resultIndex: number; results: ArrayLike<SpeechRecognitionResultLike> };
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: SpeechRecognitionConstructor;
+    webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  }
+}
 
 const languages = [
   { value: "ja-JP", label: "Japanese", native: "日本語" },
@@ -105,7 +126,7 @@ function formatTime(date: Date) {
 }
 
 function TransPulse() {
-  const [mode, setMode] = useState<"demo" | "mic">("demo");
+  const [mode, setMode] = useState<"demo" | "mic">("mic");
   const [preset, setPreset] = useState("keynote");
   const [sourceLanguage, setSourceLanguage] = useState("ja-JP");
   const [targetLanguage, setTargetLanguage] = useState("en-US");
@@ -132,12 +153,17 @@ function TransPulse() {
   const indexRef = useRef(0);
   const wordTimerRef = useRef<number | undefined>(undefined);
   const sentenceTimerRef = useRef<number | undefined>(undefined);
+  const translationTimerRef = useRef<number | undefined>(undefined);
+  const translationAbortRef = useRef<AbortController | null>(null);
+  const translationRequestRef = useRef(0);
+  const currentSpeechRef = useRef("");
+  const finalTranslationQueueRef = useRef<Promise<void>>(Promise.resolve());
   const recognitionRef = useRef<{
     continuous: boolean;
     interimResults: boolean;
     lang: string;
-    onresult: ((event: SpeechRecognitionEvent) => void) | null;
-    onerror: ((event: Event) => void) | null;
+    onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+    onerror: ((event: { error?: string }) => void) | null;
     onend: (() => void) | null;
     start: () => void;
     stop: () => void;
@@ -180,6 +206,16 @@ function TransPulse() {
     setCurrentTranslation("");
   }, []);
 
+  const appendCaption = useCallback((original: string, translation: string) => {
+    if (!original.trim() && !translation.trim()) return;
+    setTranscript((previous) => [...previous, {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      original: original.trim(),
+      translation: translation.trim(),
+      time: formatTime(new Date()),
+    }]);
+  }, []);
+
   const speakNext = useCallback(() => {
     const activePreset = presets[presetRef.current];
     const utterance = activePreset.lines[indexRef.current % activePreset.lines.length];
@@ -211,6 +247,8 @@ function TransPulse() {
     return () => {
       if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
       if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
+      if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
+      translationAbortRef.current?.abort();
       recognitionRef.current?.abort();
     };
   }, []);
@@ -220,6 +258,10 @@ function TransPulse() {
     setRunning(false);
     if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
     if (sentenceTimerRef.current) window.clearTimeout(sentenceTimerRef.current);
+    if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
+    translationRequestRef.current += 1;
+    translationAbortRef.current?.abort();
+    translationAbortRef.current = null;
     if (recognitionRef.current) {
       recognitionRef.current.onend = null;
       recognitionRef.current.stop();
@@ -241,13 +283,12 @@ function TransPulse() {
         setNotice("Live microphone captions aren’t supported by this browser. Try Chrome or Microsoft Edge.");
         return;
       }
-      setNotice("Microphone captions show recognized speech as-is; translation isn’t connected in this demo.");
-      setMode("mic");
+      setNotice("");
       const recognition = new RecognitionConstructor();
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = sourceLanguage;
-      recognition.onresult = (event: SpeechRecognitionEvent) => {
+      recognition.onresult = (event: SpeechRecognitionEventLike) => {
         let finalText = "";
         let interimText = "";
         for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -255,24 +296,76 @@ function TransPulse() {
           if (result?.isFinal) finalText += result[0]?.transcript ?? "";
           else interimText += result?.[0]?.transcript ?? "";
         }
-        if (interimText) {
-          setCurrentOriginal(interimText.trim());
-          setCurrentTranslation(interimText.trim());
+        const finalCaption = finalText.trim();
+        const interimCaption = interimText.trim();
+        currentSpeechRef.current = interimCaption || finalCaption;
+
+        if (finalCaption) {
+          if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
+          translationAbortRef.current?.abort();
+          translationAbortRef.current = null;
+          setCurrentOriginal(finalCaption);
+          setCurrentTranslation("Translating…");
+          finalTranslationQueueRef.current = finalTranslationQueueRef.current.then(async () => {
+            try {
+              const translation = await translateCaption(finalCaption, sourceLanguage, targetLanguage);
+              appendCaption(finalCaption, translation);
+              if (currentSpeechRef.current === finalCaption) setCurrentTranslation(translation);
+            } catch {
+              setNotice("Could not translate recognized speech. Check your internet connection and try again.");
+            }
+          });
         }
-        if (finalText.trim()) finishCaption(finalText, finalText);
+
+        if (interimCaption) {
+          const requestId = ++translationRequestRef.current;
+          if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
+          translationAbortRef.current?.abort();
+          setCurrentOriginal(interimCaption);
+          setCurrentTranslation("Translating…");
+          translationTimerRef.current = window.setTimeout(() => {
+            const controller = new AbortController();
+            translationAbortRef.current = controller;
+            void translateCaption(interimCaption, sourceLanguage, targetLanguage, controller.signal)
+              .then((translation) => {
+                if (requestId === translationRequestRef.current && runningRef.current) {
+                  setCurrentTranslation(translation);
+                }
+              })
+              .catch((error: unknown) => {
+                if (error instanceof Error && error.name === "AbortError") return;
+                if (requestId === translationRequestRef.current) {
+                  setNotice("Could not translate recognized speech. Check your internet connection and try again.");
+                }
+              });
+          }, 350);
+        }
       };
-      recognition.onerror = () => {
-        setNotice("Microphone access was interrupted. Allow microphone access in your browser to continue.");
+      recognition.onerror = (event: { error?: string }) => {
+        const error = event.error ?? "unknown";
+        const message = error === "not-allowed" || error === "service-not-allowed"
+          ? "Microphone permission was denied. Allow microphone access in your browser settings, then try again."
+          : error === "no-speech"
+            ? "No speech was detected. Check your microphone and try again."
+            : "Speech recognition was interrupted. Check your microphone and try again.";
+        setNotice(message);
         runningRef.current = false;
         setRunning(false);
+        recognitionRef.current = null;
       };
       recognition.onend = () => {
         if (runningRef.current && recognitionRef.current === recognition) {
-          try {
-            recognition.start();
-          } catch {
-            setNotice("Please check that your microphone is available and try again.");
-          }
+          window.setTimeout(() => {
+            if (!runningRef.current || recognitionRef.current !== recognition) return;
+            try {
+              recognition.start();
+            } catch {
+              setNotice("Please check that your microphone is available and try again.");
+              runningRef.current = false;
+              setRunning(false);
+              recognitionRef.current = null;
+            }
+          }, 250);
         }
       };
       recognitionRef.current = recognition;
@@ -286,7 +379,7 @@ function TransPulse() {
         runningRef.current = false;
         setRunning(false);
         recognitionRef.current = null;
-        setNotice("Could not start the microphone. Check browser permission, then try again.");
+        setNotice("Could not start the microphone. Allow microphone access and use a secure connection, then try again.");
       }
       return;
     }
@@ -296,7 +389,7 @@ function TransPulse() {
     runningRef.current = true;
     setRunning(true);
     speakNext();
-  }, [finishCaption, mode, running, sourceLanguage, speakNext, stopStream]);
+  }, [appendCaption, finishCaption, mode, running, sourceLanguage, speakNext, stopStream, targetLanguage]);
 
   const choosePreset = (value: string) => {
     stopStream();
@@ -372,12 +465,12 @@ function TransPulse() {
           <div className="flex items-center gap-2 sm:gap-3">
             <div className="hidden items-center gap-1.5 sm:flex">
               <Languages size={15} className="text-primary" />
-              <Select value={sourceLanguage} onValueChange={setSourceLanguage}>
+              <Select value={sourceLanguage} onValueChange={setSourceLanguage} disabled={running}>
                 <SelectTrigger aria-label="Source language" className="h-8 w-[126px] border-transparent bg-secondary/60 text-xs shadow-none"><SelectValue /></SelectTrigger>
                 <SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent>
               </Select>
               <span className="text-xs text-muted-foreground">→</span>
-              <Select value={targetLanguage} onValueChange={setTargetLanguage}>
+              <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={running}>
                 <SelectTrigger aria-label="Caption language" className="h-8 w-[126px] border-transparent bg-secondary/60 text-xs shadow-none"><SelectValue /></SelectTrigger>
                 <SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent>
               </Select>
@@ -389,9 +482,9 @@ function TransPulse() {
           </div>
         </div>
         <div className="flex items-center gap-2 border-t border-border/60 px-4 py-2 sm:hidden">
-          <Select value={sourceLanguage} onValueChange={setSourceLanguage}><SelectTrigger aria-label="Source language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
+          <Select value={sourceLanguage} onValueChange={setSourceLanguage} disabled={running}><SelectTrigger aria-label="Source language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
           <span className="text-muted-foreground">→</span>
-          <Select value={targetLanguage} onValueChange={setTargetLanguage}><SelectTrigger aria-label="Caption language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
+          <Select value={targetLanguage} onValueChange={setTargetLanguage} disabled={running}><SelectTrigger aria-label="Caption language" className="h-8 flex-1 text-xs"><SelectValue /></SelectTrigger><SelectContent>{languages.map((language) => <SelectItem key={language.value} value={language.value}>{language.label}</SelectItem>)}</SelectContent></Select>
         </div>
         {exportOpen && <div className="absolute right-4 top-[60px] z-50 w-52 border border-border bg-popover p-1.5 shadow-lg sm:right-8">
           <div className="px-2.5 py-2 text-[10px] uppercase tracking-[1.5px] text-muted-foreground">Download transcript</div>
@@ -422,7 +515,7 @@ function TransPulse() {
           <div className="flex flex-1 flex-col px-4 py-5 sm:px-7 sm:py-7">
             <div className="stage relative flex min-h-[390px] flex-1 flex-col overflow-hidden border border-border sm:min-h-[480px]" style={{ "--subtitle-opacity": opacity[0] / 100 } as React.CSSProperties}>
               <div className="scan-line" aria-hidden="true" />
-              <div className="absolute left-5 top-4 z-10 flex items-center gap-2 text-[10px] tracking-[1.7px] text-muted-foreground sm:left-7 sm:top-6"><span className="stage-square" />{presetInfo.category}<span className="mx-1 text-border">/</span>{mode === "demo" ? "TRANSLATION PREVIEW" : "LIVE TRANSCRIPTION"}</div>
+              <div className="absolute left-5 top-4 z-10 flex items-center gap-2 text-[10px] tracking-[1.7px] text-muted-foreground sm:left-7 sm:top-6"><span className="stage-square" />{mode === "demo" ? presetInfo.category : "LIVE SESSION"}<span className="mx-1 text-border">/</span>{mode === "demo" ? "TRANSLATION PREVIEW" : "LIVE TRANSLATION"}</div>
               <div className="absolute right-5 top-4 z-10 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground sm:right-7 sm:top-6"><span className="size-1.5 rounded-full bg-primary" />{clock}</div>
 
               <div className="soundscape" aria-hidden="true"><div className={running ? "wave-grid is-moving" : "wave-grid"}>{Array.from({ length: 66 }, (_, index) => <i key={index} style={{ "--bar-index": index } as React.CSSProperties} />)}</div><div className="sound-axis" /></div>
@@ -461,7 +554,7 @@ function TransPulse() {
               <div className="flex items-center justify-between"><div><div className="text-xs font-medium">Original captions</div><div className="mt-1 text-[10px] text-muted-foreground">Show above {translationLabel}</div></div><Switch aria-label="Show original captions" checked={bilingual} onCheckedChange={setBilingual} /></div>
             </div>}
 
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 text-[10px] text-muted-foreground"><div className="flex items-center gap-2"><Radio size={13} /><span>{mode === "demo" ? "SIMULATION" : "SPEECH RECOGNITION"}</span><span className="text-border">·</span><span>{mode === "demo" ? "Streaming preview only" : "Speech recognized locally in your browser"}</span></div><span className="font-mono">{mode === "demo" ? "~120 MS" : recognitionAvailable ? "LIVE" : "UNAVAILABLE"}</span></div>
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-3 text-[10px] text-muted-foreground"><div className="flex items-center gap-2"><Radio size={13} /><span>{mode === "demo" ? "SIMULATION" : "SPEECH + TRANSLATION"}</span><span className="text-border">·</span><span>{mode === "demo" ? "Streaming preview only" : "Speech recognition and translation use online services"}</span></div><span className="font-mono">{mode === "demo" ? "~120 MS" : recognitionAvailable ? "LIVE" : "UNAVAILABLE"}</span></div>
           </div>
         </section>
 
