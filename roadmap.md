@@ -1,0 +1,3 @@
+- [ ] Replace the home placeholder with the TransPulse live-captioning workspace.
+- [ ] Implement simulation presets, browser microphone captions, subtitle settings, transcript search, and exports.
+- [ ] Verify the primary screen and live simulation in the preview; run the relevant test and inspect build status.
