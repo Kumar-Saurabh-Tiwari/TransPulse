@@ -40,7 +40,7 @@ in a transcript panel where they can be searched, copied, cleared, or downloaded
 | | |
 | --- | --- |
 | **Modes** | Prepared demo conversations and browser microphone capture |
-| **Languages** | Japanese, Spanish, German, French, Korean, and English |
+| **Languages** | Japanese, Hindi, Spanish, German, French, Korean, and English |
 | **Transcript exports** | Plain text (`.txt`), SubRip subtitles (`.srt`), and JSON (`.json`) |
 | **Layout** | Responsive studio with a caption stage, session controls, and transcript |
 
@@ -69,6 +69,13 @@ into a second header row.
   do not play or analyze audio.
 - **Microphone captions:** use the browser's SpeechRecognition API for
   continuous recognition and translate recognized text as the session runs.
+  Interim speech is translated with a short debounce; finalized phrases are
+  translated immediately without waiting for older network requests.
+- **Hindi support:** select Hindi (हिन्दी) as either the recognition language
+  or the translation language.
+- **High-visibility captions:** English translations start at a larger size
+  than the original speech, and the stage shows an animated ECG-style signal
+  while a session is live.
 - **Bilingual display:** show or hide the original text above the translated
   caption.
 - **Caption customization:** adjust subtitle size and backdrop opacity.

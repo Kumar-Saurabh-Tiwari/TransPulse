@@ -32,6 +32,19 @@ describe("translateCaption", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("uses Hindi language codes for Hindi-to-English translation", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [[["Hello", "नमस्ते"]]],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(translateCaption("नमस्ते", "hi-IN", "en-US")).resolves.toBe("Hello");
+    const requestUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(requestUrl.searchParams.get("sl")).toBe("hi");
+    expect(requestUrl.searchParams.get("tl")).toBe("en");
+  });
+
   it("reports a service failure instead of silently echoing the source text", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 503 }));
 

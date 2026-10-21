@@ -74,6 +74,7 @@ declare global {
 
 const languages = [
   { value: "ja-JP", label: "Japanese", native: "日本語" },
+  { value: "hi-IN", label: "Hindi", native: "हिन्दी" },
   { value: "es-ES", label: "Spanish", native: "Español" },
   { value: "de-DE", label: "German", native: "Deutsch" },
   { value: "fr-FR", label: "French", native: "Français" },
@@ -132,8 +133,8 @@ function TransPulse() {
   const [targetLanguage, setTargetLanguage] = useState("en-US");
   const [running, setRunning] = useState(false);
   const [bilingual, setBilingual] = useState(true);
-  const [fontSize, setFontSize] = useState([34]);
-  const [opacity, setOpacity] = useState([82]);
+  const [fontSize, setFontSize] = useState([48]);
+  const [opacity, setOpacity] = useState([94]);
   const [pace, setPace] = useState([48]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
@@ -156,8 +157,10 @@ function TransPulse() {
   const translationTimerRef = useRef<number | undefined>(undefined);
   const translationAbortRef = useRef<AbortController | null>(null);
   const translationRequestRef = useRef(0);
-  const currentSpeechRef = useRef("");
-  const finalTranslationQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const currentCaptionIdRef = useRef(0);
+  const sessionGenerationRef = useRef(0);
+  const captionIdRef = useRef(0);
+  const sessionStartedAtRef = useRef<number | null>(null);
   const recognitionRef = useRef<{
     continuous: boolean;
     interimResults: boolean;
@@ -185,18 +188,25 @@ function TransPulse() {
 
   useEffect(() => {
     if (!running) return;
-    const startedAt = Date.now() - transcript.length * 12_000;
     const timer = window.setInterval(() => {
+      const startedAt = sessionStartedAtRef.current ?? Date.now();
       const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-      setClock(new Date(elapsed * 1000).toISOString().slice(11, 19));
+      const hours = Math.floor(elapsed / 3600);
+      const minutes = Math.floor((elapsed % 3600) / 60);
+      const seconds = elapsed % 60;
+      setClock(
+        [hours, minutes, seconds]
+          .map((value) => String(value).padStart(2, "0"))
+          .join(":"),
+      );
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [running, transcript.length]);
+  }, [running]);
 
   const finishCaption = useCallback((original: string, translation: string) => {
     if (!original.trim() && !translation.trim()) return;
     const caption: Caption = {
-      id: Date.now() + Math.floor(Math.random() * 1000),
+      id: ++captionIdRef.current,
       original: original.trim(),
       translation: translation.trim() || original.trim(),
       time: formatTime(new Date()),
@@ -204,16 +214,6 @@ function TransPulse() {
     setTranscript((previous) => [...previous, caption]);
     setCurrentOriginal("");
     setCurrentTranslation("");
-  }, []);
-
-  const appendCaption = useCallback((original: string, translation: string) => {
-    if (!original.trim() && !translation.trim()) return;
-    setTranscript((previous) => [...previous, {
-      id: Date.now() + Math.floor(Math.random() * 1000),
-      original: original.trim(),
-      translation: translation.trim(),
-      time: formatTime(new Date()),
-    }]);
   }, []);
 
   const speakNext = useCallback(() => {
@@ -254,6 +254,7 @@ function TransPulse() {
   }, []);
 
   const stopStream = useCallback(() => {
+    sessionGenerationRef.current += 1;
     runningRef.current = false;
     setRunning(false);
     if (wordTimerRef.current) window.clearTimeout(wordTimerRef.current);
@@ -298,26 +299,41 @@ function TransPulse() {
         }
         const finalCaption = finalText.trim();
         const interimCaption = interimText.trim();
-        currentSpeechRef.current = interimCaption || finalCaption;
-
         if (finalCaption) {
+          const sessionGeneration = sessionGenerationRef.current;
+          const captionTime = formatTime(new Date());
+          const captionId = ++captionIdRef.current;
+          currentCaptionIdRef.current = captionId;
+          translationRequestRef.current += 1;
           if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
           translationAbortRef.current?.abort();
           translationAbortRef.current = null;
           setCurrentOriginal(finalCaption);
           setCurrentTranslation("Translating…");
-          finalTranslationQueueRef.current = finalTranslationQueueRef.current.then(async () => {
-            try {
-              const translation = await translateCaption(finalCaption, sourceLanguage, targetLanguage);
-              appendCaption(finalCaption, translation);
-              if (currentSpeechRef.current === finalCaption) setCurrentTranslation(translation);
-            } catch {
-              setNotice("Could not translate recognized speech. Check your internet connection and try again.");
-            }
-          });
+          void translateCaption(finalCaption, sourceLanguage, targetLanguage)
+            .then((translation) => {
+              if (sessionGeneration !== sessionGenerationRef.current) return;
+              const caption: Caption = {
+                id: captionId,
+                original: finalCaption,
+                translation,
+                time: captionTime,
+              };
+              setTranscript((previous) => [...previous, caption].sort((a, b) => a.id - b.id));
+              if (currentCaptionIdRef.current === captionId) setCurrentTranslation(translation);
+            })
+            .catch(() => {
+              if (sessionGeneration === sessionGenerationRef.current) {
+                setNotice("Could not translate recognized speech. Check your internet connection and try again.");
+                if (currentCaptionIdRef.current === captionId) {
+                  setCurrentTranslation("Translation unavailable");
+                }
+              }
+            });
         }
 
         if (interimCaption) {
+          currentCaptionIdRef.current = 0;
           const requestId = ++translationRequestRef.current;
           if (translationTimerRef.current) window.clearTimeout(translationTimerRef.current);
           translationAbortRef.current?.abort();
@@ -338,16 +354,22 @@ function TransPulse() {
                   setNotice("Could not translate recognized speech. Check your internet connection and try again.");
                 }
               });
-          }, 350);
+          }, 180);
         }
       };
       recognition.onerror = (event: { error?: string }) => {
         const error = event.error ?? "unknown";
+        if (error === "no-speech" || error === "network") {
+          setNotice(
+            error === "no-speech"
+              ? "No speech detected. Listening will continue."
+              : "Speech recognition lost its connection. Reconnecting…",
+          );
+          return;
+        }
         const message = error === "not-allowed" || error === "service-not-allowed"
           ? "Microphone permission was denied. Allow microphone access in your browser settings, then try again."
-          : error === "no-speech"
-            ? "No speech was detected. Check your microphone and try again."
-            : "Speech recognition was interrupted. Check your microphone and try again.";
+          : "Speech recognition was interrupted. Check your microphone and try again.";
         setNotice(message);
         runningRef.current = false;
         setRunning(false);
@@ -370,6 +392,8 @@ function TransPulse() {
       };
       recognitionRef.current = recognition;
       runningRef.current = true;
+      sessionGenerationRef.current += 1;
+      sessionStartedAtRef.current = Date.now();
       setRunning(true);
       setClock("00:00:00");
       setNotice("");
@@ -387,9 +411,11 @@ function TransPulse() {
     indexRef.current = 0;
     setClock("00:00:00");
     runningRef.current = true;
+    sessionGenerationRef.current += 1;
+    sessionStartedAtRef.current = Date.now();
     setRunning(true);
     speakNext();
-  }, [appendCaption, finishCaption, mode, running, sourceLanguage, speakNext, stopStream, targetLanguage]);
+  }, [mode, running, sourceLanguage, speakNext, stopStream, targetLanguage]);
 
   const choosePreset = (value: string) => {
     stopStream();
@@ -518,12 +544,17 @@ function TransPulse() {
               <div className="absolute left-5 top-4 z-10 flex items-center gap-2 text-[10px] tracking-[1.7px] text-muted-foreground sm:left-7 sm:top-6"><span className="stage-square" />{mode === "demo" ? presetInfo.category : "LIVE SESSION"}<span className="mx-1 text-border">/</span>{mode === "demo" ? "TRANSLATION PREVIEW" : "LIVE TRANSLATION"}</div>
               <div className="absolute right-5 top-4 z-10 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground sm:right-7 sm:top-6"><span className="size-1.5 rounded-full bg-primary" />{clock}</div>
 
-              <div className="soundscape" aria-hidden="true"><div className={running ? "wave-grid is-moving" : "wave-grid"}>{Array.from({ length: 66 }, (_, index) => <i key={index} style={{ "--bar-index": index } as React.CSSProperties} />)}</div><div className="sound-axis" /></div>
+              <div className={`soundscape${running ? " is-live" : ""}`} aria-hidden="true">
+                <svg className="ecg-trace" viewBox="0 0 720 100" preserveAspectRatio="none">
+                  <path d="M0 50h112l12-2 10 2h35l12-3 12 3h34l12-2 10 2h27l9-5 10 10 12-24 14 39 13-20 10 3h35l12-2 10 2h35l12-3 12 3h34l12-2 10 2h27l9-5 10 10 12-24 14 39 13-20 10 3h35l12-2 10 2h35l12-3 12 3h34l12-2 10 2h27l9-5 10 10 12-24 14 39 13-20 10 3h35l12-2 10 2h40" />
+                </svg>
+                <div className={running ? "wave-grid is-moving" : "wave-grid"}>{Array.from({ length: 66 }, (_, index) => <i key={index} style={{ "--bar-index": index } as React.CSSProperties} />)}</div><div className="sound-axis" />
+              </div>
               <div className="stage-caption" aria-live="polite" aria-atomic="true">
                 {currentOriginal || currentTranslation ? <div key={`${preset}-${currentTranslation}`} className="caption-enter">
                   {bilingual && showOriginal && currentOriginal && <p className="stage-original">{currentOriginal}<span className="caption-cursor" /></p>}
-                  <p className="stage-translation" style={{ fontSize: `clamp(25px, ${fontSize[0]}px, 54px)` }}>{currentTranslation || currentOriginal}<span className="caption-cursor" /></p>
-                  <span className="caption-tag"><span />LIVE CAPTION</span>
+                  <p className="stage-translation" style={{ fontSize: `clamp(30px, ${fontSize[0]}px, 72px)` }}>{currentTranslation || currentOriginal}<span className="caption-cursor" /></p>
+                  <span className="caption-tag"><span />LIVE {translationLabel.toUpperCase()} TRANSLATION</span>
                 </div> : <div className="empty-stage"><div className="empty-wave"><AudioLines size={22} /></div><h1>{running ? "Listening" : "Ready when you are"}</h1><p>{running ? "The next words will appear here." : "Start a session to see your captions in real time."}</p></div>}
               </div>
               <div className="absolute bottom-5 left-5 right-5 flex items-center justify-between sm:bottom-7 sm:left-7 sm:right-7"><div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[1.2px] text-muted-foreground"><Headphones size={13} /><span>{mode === "demo" ? "Audio simulation" : "Browser microphone"}</span></div><div className="flex items-center gap-3 text-[10px] text-muted-foreground"><span className="hidden sm:block">Caption clarity</span><span className="meter"><i /><i /><i /><i /><i /></span><span>LIVE</span></div></div>
@@ -549,7 +580,7 @@ function TransPulse() {
             </div>
 
             {settingsOpen && <div className="settings-panel grid grid-cols-1 gap-5 border-b border-border py-5 sm:grid-cols-3">
-              <div className="space-y-2"><div className="flex justify-between text-xs"><span>Subtitle size</span><span className="text-muted-foreground">{fontSize[0]} px</span></div><Slider aria-label="Subtitle size" min={25} max={48} value={fontSize} onValueChange={setFontSize} /></div>
+              <div className="space-y-2"><div className="flex justify-between text-xs"><span>Subtitle size</span><span className="text-muted-foreground">{fontSize[0]} px</span></div><Slider aria-label="Subtitle size" min={30} max={64} value={fontSize} onValueChange={setFontSize} /></div>
               <div className="space-y-2"><div className="flex justify-between text-xs"><span>Caption backdrop</span><span className="text-muted-foreground">{opacity[0]}%</span></div><Slider aria-label="Caption backdrop opacity" min={30} max={100} value={opacity} onValueChange={setOpacity} /></div>
               <div className="flex items-center justify-between"><div><div className="text-xs font-medium">Original captions</div><div className="mt-1 text-[10px] text-muted-foreground">Show above {translationLabel}</div></div><Switch aria-label="Show original captions" checked={bilingual} onCheckedChange={setBilingual} /></div>
             </div>}
